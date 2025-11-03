@@ -1,0 +1,652 @@
+import streamlit as st
+import numpy as np
+import librosa
+import soundfile as sf
+from scipy import signal
+from pathlib import Path
+import plotly.graph_objs as go
+import tempfile, io, warnings
+
+warnings.filterwarnings("ignore")
+
+# Try high-quality stretcher if available
+try:
+    import pyrubberband as prb
+except Exception:
+    prb = None
+
+# =============================
+# Utility / DSP helpers
+# =============================
+
+def to_stereo_2d(x: np.ndarray) -> np.ndarray:
+    """Return (2, N) float32 array."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = np.stack([x, x])
+    elif x.ndim == 2 and x.shape[0] > 2:
+        x = x[:2, :]
+    elif x.ndim == 2 and x.shape[0] == 1:
+        x = np.stack([x[0], x[0]])
+    return x.astype(np.float32, copy=False)
+
+def to_stereo_player(x: np.ndarray) -> np.ndarray:
+    """Return (N, 2) float32 clipped to [-1,1] for writing/playing."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = np.column_stack([x, x])
+    elif x.ndim == 2 and x.shape[0] == 2:
+        x = x.T
+    # clip & norm
+    m = np.max(np.abs(x)) if x.size else 1.0
+    if m > 0:
+        x = 0.95 * x / m
+    return np.clip(x, -1.0, 1.0).astype(np.float32, copy=False)
+
+def soft_limiter(x, drive_db=3.0):
+    drive = 10 ** (drive_db / 20.0)
+    return (np.tanh(x * drive) / np.tanh(drive)).astype(np.float32)
+
+def butter_hp(cut_hz, sr, order=2):
+    return signal.butter(order, max(10.0, cut_hz) / (sr / 2), btype="highpass", output="sos")
+
+def butter_lp(cut_hz, sr, order=2):
+    return signal.butter(order, min(sr/2 - 100.0, cut_hz) / (sr / 2), btype="lowpass", output="sos")
+
+def apply_sos_stereo(x, sos):
+    return np.vstack([signal.sosfilt(sos, x[0]), signal.sosfilt(sos, x[1])]).astype(np.float32)
+
+def detect_key_index(y, sr):
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+    return int(np.argmax(chroma))
+
+# ---------- Robust BPM estimation ----------
+def robust_bpm(y_mono, sr, guess=None):
+    """Estimate BPM by fusing tempogram and autocorrelation peaks for stability."""
+    guess_bias = float(guess) if (guess and guess > 0) else 124.0
+    min_bpm, max_bpm = 55.0, 195.0
+    hop = 512
+    try:
+        _, y_perc = librosa.effects.hpss(y_mono)
+    except Exception:
+        y_perc = y_mono
+    onset_env = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop, aggregate=np.mean)
+    if onset_env.size < 16:
+        return float(guess_bias)
+    onset_env = onset_env.astype(np.float32)
+    onset_env -= float(np.min(onset_env))
+    max_env = float(np.max(onset_env))
+    if max_env > 0:
+        onset_env /= max_env
+    try:
+        tempo_bt, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop, start_bpm=guess_bias, tightness=80)
+    except Exception:
+        tempo_bt = guess_bias
+    strengths = {}
+    def push(bpm, temp_w=0.0, acf_w=0.0, tag=None):
+        if not np.isfinite(bpm) or bpm <= 0:
+            return
+        bpm = float(bpm)
+        if bpm < min_bpm or bpm > max_bpm:
+            return
+        key = round(bpm, 3)
+        data = strengths.setdefault(key, {"bpm": bpm, "temp": 0.0, "acf": 0.0, "tags": set()})
+        data["temp"] = max(data["temp"], float(temp_w))
+        data["acf"] = max(data["acf"], float(acf_w))
+        if tag:
+            data["tags"].add(tag)
+    try:
+        tempogram = np.abs(librosa.feature.tempogram(onset_envelope=onset_env, sr=sr, hop_length=hop))
+    except Exception:
+        tempogram = None
+    if tempogram is not None and tempogram.size > 0:
+        freqs = librosa.tempo_frequencies(tempogram.shape[0], sr=sr, hop_length=hop)
+        mask = (freqs >= min_bpm) & (freqs <= max_bpm)
+        if np.any(mask):
+            temp_energy = tempogram[mask].mean(axis=1)
+            if temp_energy.size > 0:
+                temp_energy = temp_energy.astype(np.float32)
+                temp_energy /= (np.max(temp_energy) + 1e-9)
+                top_idx = np.argsort(temp_energy)[-12:]
+                sel_freqs = freqs[mask]
+                for idx in top_idx:
+                    push(sel_freqs[idx], temp_w=temp_energy[idx], tag="tempogram")
+    max_lag = int(round(sr * 60.0 / (min_bpm * hop)))
+    acf = librosa.autocorrelate(onset_env, max_size=max_lag + 1)
+    min_lag = max(1, int(round(sr * 60.0 / (max_bpm * hop))))
+    acf[:min_lag] = 0.0
+    acf = acf[:max_lag + 1]
+    if acf.size > 0:
+        acf_norm = acf / (np.max(acf) + 1e-9)
+        idxs = np.argsort(acf_norm)[-12:]
+        for idx in idxs:
+            if idx < min_lag:
+                continue
+            bpm = 60.0 * sr / (idx * hop)
+            push(bpm, acf_w=acf_norm[idx], tag="acf")
+    if tempo_bt > 0:
+        for factor in (0.5, 1.0, 2.0):
+            push(tempo_bt * factor, tag="beat")
+    push(guess_bias, tag="guess")
+    push(guess_bias * 2.0, tag="guess")
+    push(guess_bias * 0.5, tag="guess")
+    if not strengths:
+        return float(guess_bias)
+    temp_max = max((d["temp"] for d in strengths.values()), default=0.0)
+    acf_max = max((d["acf"] for d in strengths.values()), default=0.0)
+    temp_max = temp_max if temp_max > 0 else 1.0
+    acf_max = acf_max if acf_max > 0 else 1.0
+    best_score, best_bpm = -np.inf, guess_bias
+    for data in strengths.values():
+        bpm = data["bpm"]
+        temp_w = data["temp"] / temp_max
+        acf_w = data["acf"] / acf_max
+        bias_guess = np.exp(-0.5 * ((bpm - guess_bias) / 10.0) ** 2)
+        bias_house = np.exp(-0.5 * ((bpm - 124.0) / 18.0) ** 2)
+        bias_bt = np.exp(-0.5 * ((bpm - tempo_bt) / 12.0) ** 2) if tempo_bt > 0 else 0.0
+        score = 0.55 * temp_w + 0.35 * acf_w + 0.1 * bias_bt
+        score *= 0.6 + 0.4 * max(bias_guess, bias_house)
+        if score > best_score:
+            best_score, best_bpm = score, bpm
+    def eval_score(bpm):
+        if bpm < min_bpm or bpm > max_bpm:
+            return -np.inf
+        key = round(bpm, 3)
+        temp_w = strengths.get(key, {}).get("temp", 0.0) / temp_max
+        acf_w = strengths.get(key, {}).get("acf", 0.0) / acf_max
+        bias_guess = np.exp(-0.5 * ((bpm - guess_bias) / 10.0) ** 2)
+        bias_house = np.exp(-0.5 * ((bpm - 124.0) / 18.0) ** 2)
+        bias_bt = np.exp(-0.5 * ((bpm - tempo_bt) / 12.0) ** 2) if tempo_bt > 0 else 0.0
+        score = 0.55 * temp_w + 0.35 * acf_w + 0.1 * bias_bt
+        return score * (0.6 + 0.4 * max(bias_guess, bias_house))
+    for factor in (0.5, 2.0):
+        alt = best_bpm * factor
+        alt_score = eval_score(alt)
+        if np.isfinite(alt_score) and alt_score >= best_score * 0.97:
+            if abs(alt - guess_bias) < abs(best_bpm - guess_bias):
+                best_bpm, best_score = alt, alt_score
+    return float(best_bpm)
+def engine_time_stretch(y, sr, rate):
+    """Stretch stereo by rate (target/original)."""
+    y = to_stereo_2d(y)
+    outs = []
+    for ch in range(2):
+        if prb is not None:
+            outs.append(prb.time_stretch(y[ch], sr, rate))
+        else:
+            outs.append(librosa.effects.time_stretch(y[ch], rate=rate))
+    L = min(len(outs[0]), len(outs[1]))
+    return np.stack([outs[0][:L], outs[1][:L]], axis=0)
+
+def stretch_to_exact_bpm(y, sr, target_bpm, guess=None, tolerance=0.005):
+    """Two-pass stretch to achieve target BPM precisely (±0.5% default)."""
+    y_mono = librosa.to_mono(to_stereo_2d(y))
+    bpm0 = robust_bpm(y_mono, sr, guess=guess)
+    rate1 = float(target_bpm) / max(bpm0, 1e-6)   # IMPORTANT: target / original
+    y1 = engine_time_stretch(y, sr, rate1)
+    bpm1 = robust_bpm(librosa.to_mono(y1), sr, guess=target_bpm)
+    if abs(bpm1 - target_bpm) / target_bpm > tolerance:
+        rate2 = float(target_bpm) / max(bpm1, 1e-6)
+        y2 = engine_time_stretch(y1, sr, rate2)
+        bpm2 = robust_bpm(librosa.to_mono(y2), sr, guess=target_bpm)
+        return y2, float(bpm2)
+    return y1, float(bpm1)
+
+# ---------- Beat tools & transitions ----------
+def beatgrid(y_mono, sr, bpm):
+    try:
+        onset_env = librosa.onset.onset_strength(y=y_mono, sr=sr)
+        _, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, units="frames")
+        if bpm is None or bpm <= 0:
+            beat_times = librosa.frames_to_time(beats, sr=sr)
+        else:
+            # If bpm provided, generate a regular grid from first beat
+            bt_tmp = librosa.frames_to_time(beats, sr=sr)
+            if len(bt_tmp) == 0:
+                raise RuntimeError
+            start = bt_tmp[0]
+            period = 60.0 / bpm
+            duration = len(y_mono) / sr
+            beat_times = np.arange(start, duration, period)
+    except Exception:
+        if bpm is None or bpm <= 0:
+            bpm = 120.0
+        period = 60.0 / bpm
+        duration = len(y_mono) / sr
+        beat_times = np.arange(0, duration, period)
+    bars = []
+    for i in range(0, max(0, len(beat_times) - 4), 4):
+        bars.append((beat_times[i], beat_times[i + 4]))
+    return beat_times, bars
+
+def choose_transition_window(y_mono, sr, bars, bars_needed=8, bias="none"):
+    if len(bars) < bars_needed + 1:
+        start = bars[max(0, len(bars) - bars_needed)][0]
+        end = bars[-1][1]
+        return start, end
+    rms = librosa.feature.rms(y=y_mono, frame_length=2048, hop_length=512).flatten()
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
+    def energy(t0, t1):
+        m = (times >= t0) & (times < t1)
+        return float(np.mean(rms[m])) if np.any(m) else 1e9
+    total_windows = max(1, len(bars) - bars_needed)
+    best_e = 1e9
+    best = (bars[-(bars_needed + 1)][0], bars[-1][1])
+    for i in range(total_windows):
+        t0, _ = bars[i]
+        _, t1 = bars[i + bars_needed]
+        weight = energy(t0, t1)
+        if total_windows > 1:
+            norm = i / (total_windows - 1)
+        else:
+            norm = 0.0
+        if bias == "head":
+            weight *= 0.7 + 0.3 * norm
+        elif bias == "tail":
+            weight *= 0.7 + 0.3 * (1.0 - norm)
+        weight *= (1.0 + 0.001 * i)
+        if weight < best_e:
+            best_e = weight
+            best = (t0, t1)
+    return best
+
+def equal_power_env(n):
+    t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    return (np.cos(t * np.pi * 0.5) ** 2, np.sin(t * np.pi * 0.5) ** 2)
+
+def loudness_db(y):
+    y_mono = librosa.to_mono(to_stereo_2d(y))
+    if y_mono.size == 0:
+        return -80.0
+    rms = float(np.sqrt(np.mean(np.square(y_mono))))
+    if rms <= 1e-7:
+        return -80.0
+    return float(20.0 * np.log10(max(rms, 1e-7)))
+
+def apply_gain_db(y, gain_db):
+    gain = 10.0 ** (gain_db / 20.0)
+    return (np.asarray(y, dtype=np.float32) * gain)
+
+def match_loudness(reference, to_adjust, clamp_db=8.0):
+    ref_db = loudness_db(reference)
+    adj_db = loudness_db(to_adjust)
+    gain_db = float(np.clip(ref_db - adj_db, -clamp_db, clamp_db))
+    return apply_gain_db(to_adjust, gain_db), gain_db
+
+def split_bands(x, sr, split_hz=180.0):
+    sos_lp = butter_lp(split_hz, sr, 4)
+    sos_hp = butter_hp(split_hz, sr, 4)
+    low = apply_sos_stereo(x, sos_lp)
+    high = apply_sos_stereo(x, sos_hp)
+    return low, high
+
+def align_lowband_phase(low1, low2, sr, bpm, max_shift_beats=0.75):
+    m1 = np.mean(low1, axis=0)
+    m2 = np.mean(low2, axis=0)
+    spb = int(sr * 60.0 / max(bpm, 1e-6))
+    max_lag = int(spb * max_shift_beats)
+    m1 = (m1 - np.mean(m1)) / (np.std(m1) + 1e-8)
+    m2 = (m2 - np.mean(m2)) / (np.std(m2) + 1e-8)
+    xcorr = signal.correlate(m2, m1, mode="full")
+    lags = np.arange(-len(m1) + 1, len(m2))
+    m = (lags >= -max_lag) & (lags <= max_lag)
+    lags = lags[m]; xcorr = xcorr[m]
+    return int(lags[np.argmax(xcorr)])
+
+def apply_sample_shift(x, shift):
+    if shift == 0: return x
+    C, N = x.shape
+    if shift > 0:
+        pad = np.zeros((C, shift), dtype=x.dtype)
+        return np.concatenate([pad, x[:, :N]], axis=1)[:, :N]
+    else:
+        shift = -shift
+        pad = np.zeros((C, shift), dtype=x.dtype)
+        return np.concatenate([x[:, shift:], pad], axis=1)
+
+def sidechain_duck(outgoing, incoming_low_mono, sr, duck_db=5.0, attack_ms=15, release_ms=180):
+    rect = np.abs(incoming_low_mono)
+    a_a = np.exp(-1.0 / (sr * attack_ms * 0.001))
+    a_r = np.exp(-1.0 / (sr * release_ms * 0.001))
+    env = np.zeros_like(rect)
+    for i in range(1, len(rect)):
+        if rect[i] > env[i-1]:
+            env[i] = a_a * env[i-1] + (1 - a_a) * rect[i]
+        else:
+            env[i] = a_r * env[i-1] + (1 - a_r) * rect[i]
+    env /= (np.max(env) + 1e-8)
+    duck_lin = 10 ** (-duck_db / 20.0)
+    gain = 1.0 - env * (1.0 - duck_lin)
+    return outgoing * gain[None, :]
+
+# =============================
+# Master Mixer
+# =============================
+class MasterMixer:
+    def __init__(self):
+        self.sr = 44100
+        self.song1 = None
+        self.song2 = None
+        self.last_transition = {}
+        self.params = {
+            "target_bpm": 126,
+            "crossfade_seconds": 20,
+            "intro_seconds": 8,
+            "outro_seconds": 16,
+            "low_cut": 30,
+            "high_cut": 18000,
+            "split_hz": 180.0,
+            "enable_key_match": True,
+            "enable_filter_sweeps": True,
+            "enable_sidechain": True,
+            "enable_bass_carve": True
+        }
+
+    def reset(self):
+        self.song1 = None
+        self.song2 = None
+
+    def load_song(self, file, idx):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.name).suffix) as tmp:
+            tmp.write(file.read()); tmp_path = tmp.name
+        y, sr = librosa.load(tmp_path, sr=self.sr, mono=False)
+        Path(tmp_path).unlink(missing_ok=True)
+        y = to_stereo_2d(y)
+        y_mono = librosa.to_mono(y)
+        bpm = robust_bpm(y_mono, self.sr, guess=self.params.get("target_bpm"))
+        key_idx = detect_key_index(y_mono, self.sr)
+        dur = len(y_mono) / self.sr
+        data = {"audio": y, "sr": self.sr, "tempo": float(bpm), "key_index": int(key_idx), "duration": float(dur)}
+        if idx == 1: self.song1 = data
+        else: self.song2 = data
+        return data
+
+    def normalize_peak(self, y):
+        m = float(np.max(np.abs(y))) if y.size else 1.0
+        return (y / m * 0.95).astype(np.float32) if m > 0 else y
+
+    def intro_outro(self, y, intro_s, outro_s):
+        n = y.shape[1]; env = np.ones(n, dtype=np.float32)
+        if intro_s > 0:
+            ni = int(intro_s * self.sr); env[:ni] = np.linspace(0.0, 1.0, ni, dtype=np.float32)
+        if outro_s > 0:
+            no = int(outro_s * self.sr); env[-no:] = np.linspace(1.0, 0.0, no, dtype=np.float32)
+        return y * env[None, :]
+
+    def crossfade(self, s1, s2, fade_seconds, bpm, cfg):
+        sr = self.sr
+        y1_mono = librosa.to_mono(s1); y2_mono = librosa.to_mono(s2)
+        _, bars1 = beatgrid(y1_mono, sr, bpm); _, bars2 = beatgrid(y2_mono, sr, bpm)
+
+        spb = 60.0 / bpm
+        beats_wanted = max(32, int((int(round(fade_seconds / spb)) // 4) * 4))
+        fade_samples = int(beats_wanted * spb * sr)
+
+        t1, _ = choose_transition_window(y1_mono, sr, bars1, bars_needed=beats_wanted // 4, bias="tail")
+        t2, _ = choose_transition_window(y2_mono, sr, bars2, bars_needed=beats_wanted // 4, bias="head")
+
+        start1 = max(0, int(round(t1 * sr)))
+        start2 = max(0, int(round(t2 * sr)))
+
+        max_len1 = max(0, s1.shape[1] - start1)
+        max_len2 = max(0, s2.shape[1] - start2)
+        fade_samples = min(fade_samples, max_len1, max_len2)
+
+        if fade_samples <= 0:
+            fallback = min(s1.shape[1], s2.shape[1])
+            fade_samples = max(1, fallback)
+            start1 = max(0, s1.shape[1] - fade_samples)
+            start2 = 0
+            max_len1 = max(0, s1.shape[1] - start1)
+            max_len2 = max(0, s2.shape[1] - start2)
+            fade_samples = min(fade_samples, max_len1, max_len2)
+
+        def pad_to(x, L):
+            if x.shape[1] >= L: return x[:, :L]
+            pad = np.zeros((x.shape[0], L - x.shape[1]), dtype=x.dtype)
+            return np.concatenate([x, pad], axis=1)
+
+        a1 = s1[:, start1:start1 + fade_samples].copy()
+        a2 = s2[:, start2:start2 + fade_samples].copy()
+        a1 = pad_to(a1, fade_samples); a2 = pad_to(a2, fade_samples)
+        a1_orig = a1.copy(); a2_orig = a2.copy()
+
+        low1, _ = split_bands(a1, sr, cfg["split_hz"])
+        low2, _ = split_bands(a2, sr, cfg["split_hz"])
+        lag = align_lowband_phase(low1, low2, sr, bpm, 0.75)
+
+        if lag != 0:
+            s2 = apply_sample_shift(s2, lag)
+            a2 = s2[:, start2:start2 + fade_samples]
+            a2 = pad_to(a2, fade_samples)
+            a2_orig = a2.copy()
+            low2, _ = split_bands(a2, sr, cfg["split_hz"])
+
+        out_env, in_env = equal_power_env(fade_samples)
+
+        if cfg["enable_filter_sweeps"]:
+            hp_lo = apply_sos_stereo(a1, butter_hp(120.0, sr, 2)); hp_hi = apply_sos_stereo(a1, butter_hp(420.0, sr, 2))
+            lp_lo = apply_sos_stereo(a2, butter_lp(600.0, sr, 2)); lp_hi = apply_sos_stereo(a2, butter_lp(18000.0, sr, 2))
+            t = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+            a1 = hp_lo * (1.0 - t)[None, :] + hp_hi * t[None, :]
+            a2 = lp_lo * (1.0 - t)[None, :] + lp_hi * t[None, :]
+
+        if cfg["enable_bass_carve"]:
+            a1 = apply_sos_stereo(a1, butter_hp(140.0, sr, 2))
+            a2 = apply_sos_stereo(a2, butter_hp(120.0, sr, 2))
+
+        if cfg["enable_sidechain"]:
+            in_low_mono = np.mean(low2, axis=0)
+            a1 = sidechain_duck(a1, in_low_mono, sr, duck_db=5.0)
+
+        cross = a1 * out_env[None, :] + a2 * in_env[None, :]
+        seam = min(sr // 4, cross.shape[1] // 8)
+        if seam > 0:
+            head_env = np.linspace(0.0, 1.0, seam, dtype=np.float32)
+            tail_env = np.linspace(1.0, 0.0, seam, dtype=np.float32)
+            cross[:, :seam] = a1_orig[:, :seam] * (1.0 - head_env)[None, :] + cross[:, :seam] * head_env[None, :]
+            cross[:, -seam:] = cross[:, -seam:] * tail_env[None, :] + a2_orig[:, -seam:] * (1.0 - tail_env)[None, :]
+
+        prefix = s1[:, :start1]
+        suffix = s2[:, start2 + fade_samples:]
+        mix = np.concatenate([prefix, cross, suffix], axis=1)
+        mix = soft_limiter(mix, 3.5)
+        self.last_transition = {"start_s1": start1, "start_s2": start2, "fade_samples": fade_samples, "lag": int(lag)}
+        return self.normalize_peak(mix)
+
+    def build_mix(self, p, report=None):
+        assert self.song1 is not None and self.song2 is not None, "Beide Songs müssen geladen sein."
+        def notify(msg, frac):
+            if report is None:
+                return
+            try:
+                report(str(msg), float(np.clip(frac, 0.0, 1.0)))
+            except Exception:
+                pass
+
+        notify("Analyse Songs", 0.05)
+
+        target_bpm = p["target_bpm"]
+        crossfade_seconds = p["crossfade_seconds"]
+
+        # 1) BPM normalization to exact target
+        notify("Song 1 -> Ziel-BPM", 0.2)
+        s1_st, bpm1 = stretch_to_exact_bpm(self.song1["audio"], self.sr, target_bpm, guess=self.song1["tempo"])
+        notify("Song 2 -> Ziel-BPM", 0.4)
+        s2_st, bpm2 = stretch_to_exact_bpm(self.song2["audio"], self.sr, target_bpm, guess=self.song2["tempo"])
+
+        notify("Key-Match pruefen", 0.55)
+        # 2) Optional key match (pitch shift AFTER time-stretch to keep BPM exact)
+        if p["enable_key_match"]:
+            k1, k2 = self.song1["key_index"], self.song2["key_index"]
+            delta = (k1 - k2) % 12
+            if delta > 6: delta -= 12
+            delta = int(np.clip(delta, -3, 3))
+            if delta != 0:
+                chs = []
+                for ch in range(2):
+                    chs.append(librosa.effects.pitch_shift(s2_st[ch], sr=self.sr, n_steps=delta))
+                L = min(len(chs[0]), len(chs[1]))
+                s2_st = np.stack([chs[0][:L], chs[1][:L]], axis=0)
+
+        notify("Band-Limits anwenden", 0.68)
+        # 3) Base band-limiting
+        for ch in range(2):
+            s1_st[ch] = signal.sosfilt(butter_hp(p["low_cut"], self.sr, 2), s1_st[ch])
+            s1_st[ch] = signal.sosfilt(butter_lp(p["high_cut"], self.sr, 2), s1_st[ch])
+            s2_st[ch] = signal.sosfilt(butter_hp(p["low_cut"], self.sr, 2), s2_st[ch])
+            s2_st[ch] = signal.sosfilt(butter_lp(p["high_cut"], self.sr, 2), s2_st[ch])
+
+        notify("Intro/Outro formen", 0.8)
+        # 4) Intro/Outro shaping
+        s1_io = self.intro_outro(s1_st, p["intro_seconds"], 0)
+        s2_io = self.intro_outro(s2_st, 0, p["outro_seconds"])
+
+        notify("Crossfade vorbereiten", 0.9)
+        # 5) Loudness match & crossfade
+        s2_io, gain_db = match_loudness(s1_io, s2_io, clamp_db=9.0)
+
+        notify("Crossfade laufen lassen", 0.93)
+        mix = self.crossfade(s1_io, s2_io, crossfade_seconds, target_bpm, p)
+        if isinstance(getattr(self, "last_transition", None), dict):
+            self.last_transition["gain_db"] = gain_db
+
+        notify("Finale Normalisierung", 0.98)
+        return mix, bpm1, bpm2
+
+# =============================
+# Visuals
+# =============================
+def plot_waveform(y_stereo, sr, title):
+    y_mono = np.mean(y_stereo, axis=0)
+    t = np.arange(len(y_mono)) / sr
+    step = max(1, len(t)//8000)  # decimate for speed
+    trace = go.Scatter(x=t[::step], y=y_mono[::step], mode="lines", name="Waveform")
+    layout = go.Layout(title=title, xaxis=dict(title="Zeit (s)"), yaxis=dict(title="Amplitude"), margin=dict(l=40,r=20,t=40,b=40), height=250)
+    fig = go.Figure(data=[trace], layout=layout)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+# =============================
+# Streamlit App
+# =============================
+def main():
+    st.set_page_config(page_title="🎧 DJ Mixer – MASTER PRO", layout="wide")
+    st.title("🎧 DJ Mixer – MASTER PRO")
+    st.caption("Exakte BPM-Normalisierung • Beat-/Kick-Alignment • Filter-Sweeps • Sidechain • Visuals • WAV-Export")
+
+    if "mx" not in st.session_state:
+        st.session_state.mx = MasterMixer()
+        st.session_state.s1_loaded = False
+        st.session_state.s2_loaded = False
+        st.session_state.mix_ready = False
+        st.session_state.audio_out = None
+
+    mx: MasterMixer = st.session_state.mx
+
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Einstellungen")
+        p = mx.params
+        p["target_bpm"] = st.slider("🎚️ Ziel-BPM (beide Songs)", 80, 180, int(p["target_bpm"]), 1)
+        p["crossfade_seconds"] = st.slider("🔁 Crossfade (Sek.)", 8, 48, int(p["crossfade_seconds"]), 1)
+        p["intro_seconds"] = st.slider("⬆️ Intro-Fade (Sek.)", 0, 32, int(p["intro_seconds"]), 1)
+        p["outro_seconds"] = st.slider("⬇️ Outro-Fade (Sek.)", 0, 32, int(p["outro_seconds"]), 1)
+        p["low_cut"] = st.slider("🪓 Low Cut (Hz)", 20, 200, int(p["low_cut"]), 1)
+        p["high_cut"] = st.slider("✨ High Cut (Hz)", 4000, 20000, int(p["high_cut"]), 500)
+        p["split_hz"] = st.slider("⚡ Split-Frequenz Low/High (Hz)", 120, 260, int(p["split_hz"]), 5)
+        st.markdown("---")
+        p["enable_key_match"] = st.checkbox("🎼 Key-Match ±3 Halbtöne", value=p["enable_key_match"])
+        colX, colY = st.columns(2)
+        with colX:
+            p["enable_filter_sweeps"] = st.checkbox("🎚️ Filter-Sweeps", value=p["enable_filter_sweeps"])
+        with colY:
+            p["enable_sidechain"] = st.checkbox("🫧 Sidechain (Light)", value=p["enable_sidechain"])
+        p["enable_bass_carve"] = st.checkbox("🥁 Bass-Carve während Crossfade", value=p["enable_bass_carve"])
+        st.markdown("---")
+        if st.button("🔄 Neu starten"):
+            mx.reset()
+            st.session_state.s1_loaded = False
+            st.session_state.s2_loaded = False
+            st.session_state.mix_ready = False
+            st.session_state.audio_out = None
+            st.rerun()
+
+        st.markdown("**Status**")
+        st.info(f"Rubberband aktiv: {'✅' if prb is not None else '❌ (Fallback Librosa)'}")
+
+    # Upload & meta
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("🎵 Song 1 (Intro)")
+        up1 = st.file_uploader("WAV/MP3/FLAC/OGG", type=["wav","mp3","flac","ogg"], key="s1")
+        if up1 and st.button("Song 1 laden", use_container_width=True):
+            meta1 = mx.load_song(up1, idx=1)
+            st.session_state.s1_loaded = True
+            st.session_state.meta1 = meta1
+            st.success("Song 1 geladen")
+        if st.session_state.get("s1_loaded"):
+            m = st.session_state.meta1
+            col = st.columns(3)
+            col[0].info(f"BPM (detected): {m['tempo']:.1f}")
+            col[1].info(f"Key-Index: {m['key_index']}")
+            col[2].info(f"Dauer: {m['duration']:.1f}s")
+            plot_waveform(m["audio"], mx.sr, "Song 1")
+
+    with c2:
+        st.subheader("🎶 Song 2 (Main)")
+        up2 = st.file_uploader("WAV/MP3/FLAC/OGG", type=["wav","mp3","flac","ogg"], key="s2")
+        if up2 and st.button("Song 2 laden", use_container_width=True):
+            meta2 = mx.load_song(up2, idx=2)
+            st.session_state.s2_loaded = True
+            st.session_state.meta2 = meta2
+            st.success("Song 2 geladen")
+        if st.session_state.get("s2_loaded"):
+            m = st.session_state.meta2
+            col = st.columns(3)
+            col[0].info(f"BPM (detected): {m['tempo']:.1f}")
+            col[1].info(f"Key-Index: {m['key_index']}")
+            col[2].info(f"Dauer: {m['duration']:.1f}s")
+            plot_waveform(m["audio"], mx.sr, "Song 2")
+
+    # Build mix
+    if st.session_state.get("s1_loaded") and st.session_state.get("s2_loaded"):
+        st.markdown("---")
+        st.subheader("🧪 Mix erstellen")
+        if st.button("?? MASTER-Mix starten", type="primary", use_container_width=True):
+            progress_bar = st.progress(0)
+            status_box = st.empty()
+            def report_status(message, frac):
+                try:
+                    pct = int(max(0.0, min(100.0, round(float(frac) * 100.0))))
+                except Exception:
+                    pct = 0
+                progress_bar.progress(pct)
+                status_box.info(str(message))
+            try:
+                audio, bpm1, bpm2 = mx.build_mix(mx.params, report=report_status)
+                progress_bar.progress(100)
+                status_box.success("Mix fertig")
+                st.session_state.audio_out = audio
+                st.session_state.mix_ready = True
+                st.session_state.bpm_meas = (bpm1, bpm2)
+            except Exception as e:
+                progress_bar.progress(0)
+                status_box.error("Fehler beim Mixen: {0}".format(e))
+    # Preview & download
+    if st.session_state.get("mix_ready"):
+        st.markdown("---")
+        st.subheader("🎧 Ergebnis & Download")
+        y = st.session_state.audio_out
+        sr = mx.sr
+        st.success(f"Ziel-BPM: {mx.params['target_bpm']} • Gemessen S1≈{st.session_state.bpm_meas[0]:.1f} • S2≈{st.session_state.bpm_meas[1]:.1f}")
+        plot_waveform(y, sr, "Finaler Mix")
+        # player
+        wav_buf = io.BytesIO()
+        sf.write(wav_buf, to_stereo_player(y), sr, format="WAV", subtype="PCM_16")
+        wav_buf.seek(0)
+        wav_bytes = wav_buf.read()
+        st.audio(wav_bytes, format="audio/wav")
+        st.download_button("⬇️ Download WAV", data=wav_bytes, file_name=f"dj_master_mix_{mx.params['target_bpm']}bpm.wav", mime="audio/wav", type="primary", use_container_width=True)
+
+if __name__ == "__main__":
+    main()
