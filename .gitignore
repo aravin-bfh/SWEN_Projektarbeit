@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# Streamlit
+.streamlit/
+
+# Audio-Dateien (nicht versionieren)
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# IDE/OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
